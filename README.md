@@ -271,6 +271,60 @@ nginx -t
 systemctl reload nginx
 ```
 
+### 通过 Nginx 查看脚本日志
+
+沿用 `/data/deployhook/state/update.log`，可以直接修改普通文件权限，不需要 ACL 或单独的日志目录。确认 `DEPLOYHOOK_SCRIPT_LOG` 已配置为此路径，日志文件生成后，由 root 执行：
+
+```bash
+chmod 0751 /data/deployhook
+chmod 0711 /data/deployhook/state
+chmod 0644 /data/deployhook/state/update.log
+```
+
+Nginx 既需要读取文件，也需要父目录的遍历权限，所以只修改日志文件为 `0644` 不够。该配置允许服务器上的其他本地用户读取这份日志；`state` 目录对其他用户只开放遍历，不开放目录列表。不要递归修改 `state` 权限，Docker 凭据子目录保持 `0700`，配置文件保持 `0600`。如果 `/data` 等更上级目录也有限制，需确认 Nginx 具备其遍历权限。
+
+网页访问继续使用密码保护。以下假设 Nginx worker 用户及组为 `www-data`，如使用其他组请对应替换；`htpasswd` 工具可由发行版的软件包提供，例如 Debian/Ubuntu 的 `apache2-utils`。首次创建访问账户：
+
+```bash
+htpasswd -cB /etc/nginx/deployhook-log.htpasswd viewer
+chown root:www-data /etc/nginx/deployhook-log.htpasswd
+chmod 0640 /etc/nginx/deployhook-log.htpasswd
+```
+
+按提示设置一个独立的访问密码，不复用 Webhook 密钥。`-c` 仅用于首次创建密码文件，后续修改账户时去掉此参数。
+
+在已有 HTTPS `server` 中增加单个日志文件的映射：
+
+```nginx
+location = /ops/hooks/production/log {
+    alias /data/deployhook/state/update.log;
+
+    types {}
+    default_type text/plain;
+    charset utf-8;
+
+    auth_basic "DeployHook logs";
+    auth_basic_user_file /etc/nginx/deployhook-log.htpasswd;
+
+    limit_except GET { deny all; }
+
+    open_file_cache off;
+    add_header Cache-Control "no-store" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+```
+
+只映射这个文件，不要把整个 `state` 目录作为网站目录。密码认证配置参见 [Nginx 官方说明](https://nginx.org/en/docs/http/ngx_http_auth_basic_module.html)。检查并加载配置：
+
+```bash
+nginx -t
+systemctl reload nginx
+```
+
+访问 `https://example.com/ops/hooks/production/log`，输入账户 `viewer` 和设置的密码。刷新页面可查看当前输出，不会像 `tail -f` 一样持续推送。
+
+程序覆盖已有日志会保留文件权限；如果删除日志后由程序重新创建，受服务 `UMask=0077` 影响，文件会变为 `0600`，需要重新执行 `chmod 0644 /data/deployhook/state/update.log`。
+
 ## 7. 业务 CI 发送 Webhook
 
 在**业务镜像构建并推送成功后**发送请求。先将本项目的 `scripts/send-webhook.py` 复制到业务仓库的同名位置；它只需要 Python 3 标准库，不需要安装依赖。
@@ -307,10 +361,13 @@ python3 scripts/send-webhook.py
 
 ### GitHub Actions 示例
 
-在**业务仓库**的 `Settings → Secrets and variables → Actions` 中设置：
+在**业务仓库**的 `Settings → Secrets and variables → Actions → Secrets` 中，通过 `New repository secret` 添加以下三个 Actions Secrets：
 
-1. `Variables`：添加 `DEPLOYHOOK_URL`，值为完整的 HTTPS Webhook 地址。
-2. `Secrets`：添加 `DEPLOYHOOK_SECRET`，值为服务器使用的同一密钥字符串。
+| Secret 名称 | 值 |
+| --- | --- |
+| `DEPLOYHOOK_URL` | 完整的 HTTPS Webhook 地址，例如 `https://example.com/ops/hooks/production/deploy` |
+| `DEPLOYHOOK_SECRET` | 与服务器使用的完全相同的密钥字符串 |
+| `DEPLOYHOOK_BODY` | JSON 请求体，例如 `{"event":"deploy","service":"myapp"}`；不需要附加信息时填写 `{}` |
 
 把以下 job 加入现有业务工作流的 `jobs` 下，将 `build-and-push` 替换为实际构建并推送镜像的 job 名称。`needs` 确保前置 job 成功后才触发部署，发送脚本需已提交到业务仓库：
 
@@ -326,10 +383,9 @@ deploy:
         persist-credentials: false
     - name: Trigger production deployment
       env:
-        DEPLOYHOOK_URL: ${{ vars.DEPLOYHOOK_URL }}
+        DEPLOYHOOK_URL: ${{ secrets.DEPLOYHOOK_URL }}
         DEPLOYHOOK_SECRET: ${{ secrets.DEPLOYHOOK_SECRET }}
-        DEPLOYHOOK_BODY: >-
-          {"event":"deploy","service":"myapp","revision":"${{ github.sha }}"}
+        DEPLOYHOOK_BODY: ${{ secrets.DEPLOYHOOK_BODY }}
       run: python3 scripts/send-webhook.py
 ```
 
