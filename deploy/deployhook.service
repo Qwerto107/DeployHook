@@ -1,0 +1,20 @@
+[Unit]
+Description=DeployHook
+After=network.target docker.service
+
+[Service]
+User=deploy
+WorkingDirectory=/data/deployhook
+EnvironmentFile=/data/deployhook/deployhook.env
+Environment=HOME=/data/deployhook/state
+ExecStart=/data/deployhook/deployhook
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=30s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
